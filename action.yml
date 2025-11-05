@@ -1,0 +1,142 @@
+---
+name: Stitch Episode
+description: Stitch a screencast episode using Docker
+inputs:
+  episode:
+    description: "Episode number (e.g. 001)"
+    required: true
+  voiceover_output_format:
+    description: "Voiceover output format"
+    default: mp3_44100_192
+    required: false
+  overwrite_voiceover:
+    description: "Regenerate voiceover files"
+    default: "false"
+    required: false
+  match:
+    description: "Match pattern for segments (e.g. 001)"
+    default: ""
+  overwrite_vhs:
+    description: "Regenerate VHS files"
+    default: "false"
+    required: false
+  elevenlabs_api_key:
+    description: "ElevenLabs API key"
+    required: true
+  github_token:
+    description: "GitHub token for cache operations"
+    required: true
+  retention:
+    description: "Retention days for artifacts"
+    default: 2
+
+runs:
+  using: composite
+  steps:
+    - name: Generate cache keys
+      shell: bash
+      run: |
+        VOICE_HASH=$(find episodes/${{ inputs.episode }}-*/scripts/*.txt -type f 2>/dev/null | sort | xargs sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "none")
+        CONTENT_HASH=$(find episodes/${{ inputs.episode }}-*/content/*.* -type f 2>/dev/null | sort | xargs sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "none")
+
+        echo "VOICE_CACHE_KEY=episode-voiceover-${{ inputs.episode }}-${VOICE_HASH}" >> $GITHUB_ENV
+        echo "VOICE_RESTORE_KEYS=episode-voiceover-${{ inputs.episode }}-" >> $GITHUB_ENV
+        echo "RAW_CACHE_KEY=episode-vhs-${{ inputs.episode }}-${CONTENT_HASH}" >> $GITHUB_ENV
+        echo "RAW_RESTORE_KEYS=episode-raw-${{ inputs.episode }}-" >> $GITHUB_ENV
+
+    - name: Find episode dir
+      shell: bash
+      run: |
+        EPISODE_DIR=$(ls -1d episodes/${{ inputs.episode }}-* | head -n 1)
+        echo "EPISODE_DIR=$EPISODE_DIR" >> $GITHUB_ENV
+
+        if [[ ! -d "$EPISODE_DIR" ]]; then
+          echo "Episode directory not found!"
+          echo "Available episodes:"
+          ls -1 episodes
+          exit 1
+        fi
+
+    - name: Restore episode voice cache
+      id: cache-voice
+      uses: actions/cache/restore@v4
+      with:
+        path: episodes/${{ inputs.episode }}-*/audio
+        key: ${{ env.VOICE_CACHE_KEY }}
+        restore-keys: ${{ env.VOICE_RESTORE_KEYS }}
+        enableCrossOsArchive: true
+
+    - name: Restore raw cache
+      id: cache-raw
+      uses: actions/cache/restore@v4
+      with:
+        path: output/${{ inputs.episode }}-*/raw/*.mp4
+        key: ${{ env.RAW_CACHE_KEY }}
+        restore-keys: ${{ env.RAW_RESTORE_KEYS }}
+        enableCrossOsArchive: true
+
+    - name: Stitch Episode
+      shell: bash
+      id: stitch
+      run: |
+        set -e
+        docker run \
+          --rm \
+          --cap-add=SYS_ADMIN \
+          --security-opt seccomp=unconfined \
+          -e ELEVENLABS_API_KEY="${{ inputs.elevenlabs_api_key }}" \
+          -v ${{ github.workspace }}:/source \
+          fnando/stitch:latest \
+          export \
+          --dir="${{ env.EPISODE_DIR }}" \
+          --voiceover-output-format=${{ inputs.voiceover_output_format }} \
+          ${{ inputs.match != '' && format('--match {0}', inputs.match) || '' }} \
+          ${{ inputs.overwrite_voiceover == 'true' && '--overwrite-voiceover' || '--no-overwrite-voiceover' }} \
+          ${{ inputs.overwrite_vhs == 'true' && '--overwrite-vhs' || '--no-overwrite-vhs' }}
+        echo "result=true" >> $GITHUB_OUTPUT
+
+    - name: Delete voice cache
+      if: steps.stitch.outputs.result == 'true'
+      shell: bash
+      run: gh cache delete "${{ env.VOICE_CACHE_KEY }}" || true
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+
+    - name: Delete raw cache
+      if: steps.stitch.outputs.result == 'true'
+      shell: bash
+      run: gh cache delete "${{ env.RAW_CACHE_KEY }}" || true
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+
+    - name: List cache entries
+      run: |
+        echo "= Voiceover Cache ="
+        ls -la episodes/${{ inputs.episode }}-*/audio || true
+        echo
+        echo "= Raw Cache ="
+        ls -la output/${{ inputs.episode }}-*/raw || true
+
+    - name: Save episode voiceover cache
+      if: steps.stitch.outputs.result == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: episodes/${{ inputs.episode }}-*/audio
+        key: ${{ env.VOICE_CACHE_KEY }}
+        enableCrossOsArchive: true
+
+    - name: Save raw recordings cache
+      if: steps.stitch.outputs.result == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: output/${{ inputs.episode }}-*/raw/*.mp4
+        key: ${{ env.RAW_CACHE_KEY }}
+        enableCrossOsArchive: true
+
+    - name: Upload output artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: output
+        path: output
+        retention-days: ${{ inputs.retention }}

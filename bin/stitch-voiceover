@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+
+const fs = require("node:fs");
+const { Readable } = require("node:stream");
+const { parseArgs } = require("node:util");
+const { ElevenLabsClient } = require("@elevenlabs/elevenlabs-js");
+
+const { values } = parseArgs({
+  options: {
+    "text-file": {
+      type: "string",
+      short: "t",
+    },
+    "output-file": {
+      type: "string",
+      short: "o",
+    },
+    force: {
+      type: "boolean",
+      short: "f",
+    },
+    "output-format": {
+      type: "string",
+      short: "q",
+      default: "mp3_44100_128",
+    },
+  },
+});
+
+if (!values["text-file"]) {
+  console.error("ERROR: --text-file is required");
+  process.exit(1);
+}
+
+if (!values["output-file"]) {
+  console.error("ERROR: --output-file is required");
+  process.exit(1);
+}
+
+const textFile = values["text-file"];
+const outputFile = values["output-file"];
+
+if (!fs.existsSync(textFile)) {
+  console.error(`ERROR: Text file not found: ${textFile}`);
+  process.exit(1);
+}
+
+if (fs.existsSync(outputFile) && !values.force) {
+  console.error(`WARNING: Output file already exists: ${outputFile}`);
+  console.error(`         Use --force to overwrite`);
+  console.error(`         Exiting with status=0`);
+  process.exit(0);
+}
+
+const text = fs.readFileSync(textFile, "utf-8").trim();
+const elevenlabs = new ElevenLabsClient();
+const fileStream = fs.createWriteStream(outputFile);
+
+(async () => {
+  const audio = await elevenlabs.textToSpeech.convert(
+    "KR1TkIhkSykEjI4B0DtH", // voice_id
+    {
+      text,
+      modelId: "eleven_multilingual_v2",
+      outputFormat: values["output-format"],
+      similarityBoost: 0.75,
+      speed: 0.9,
+      stability: 0.5,
+    },
+  );
+
+  const nodeStream = Readable.fromWeb(audio);
+  nodeStream.pipe(fileStream);
+
+  await new Promise((resolve, reject) => {
+    fileStream.on("finish", resolve);
+    fileStream.on("error", reject);
+  });
+
+  console.log(`Generated voiceover: ${outputFile}`);
+})();

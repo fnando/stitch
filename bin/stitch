@@ -1,0 +1,876 @@
+#!/usr/bin/env ruby
+
+require "json"
+require "fileutils"
+require "pathname"
+require "optparse"
+require "shellwords"
+require "etc"
+
+FONT_EXTS_GLOB = "{otf,ttf}"
+AUDIO_EXTS_GLOB = "{mp3,m4a,wav,aac,flac}"
+IMAGE_EXTS_GLOB = "{png,jpg,gif,tiff,eps}"
+
+$stdout.sync = true
+
+class String
+  def cyan
+    ansi(36)
+  end
+
+  def magenta
+    ansi(35)
+  end
+
+  def gray
+    ansi(90)
+  end
+
+  def green
+    ansi(32)
+  end
+
+  def red
+    ansi(31)
+  end
+
+  def yellow
+    ansi(33)
+  end
+
+  def blue
+    ansi(34)
+  end
+
+  def ansi(code)
+    if color_enabled?
+      "\e[#{code}m#{self}\e[0m"
+    else
+      self
+    end
+  end
+
+  def color_enabled?
+    ENV["NO_COLOR"].nil? && STDOUT.isatty
+  end
+end
+
+class CLI
+  class Export
+    attr_accessor :overwrite_voiceover,
+                  :overwrite,
+                  :overwrite_vhs,
+                  :episode_dir,
+                  :voiceover_output_format,
+                  :match,
+                  :crossfade_duration,
+                  :intro_duration,
+                  :outro_duration,
+                  :backtrack_path,
+                  :logo_path,
+                  :logo_sound_path,
+                  :font_path,
+                  :output_dir,
+                  :logs_dir
+    alias_method :overwrite_voiceover?, :overwrite_voiceover
+    alias_method :overwrite_vhs?, :overwrite_vhs
+
+    def initialize
+      self.voiceover_output_format = "mp3_44100_128"
+      self.overwrite = false
+      self.overwrite_voiceover = false
+      self.overwrite_vhs = false
+      self.match = /./
+      self.crossfade_duration = 0.5
+      self.intro_duration = 5.5
+      self.outro_duration = 5.5
+      self.backtrack_path = Pathname.pwd.join("resources/backtracks")
+      self.logo_path = Pathname.pwd
+                               .join("resources")
+                               .glob("logo.#{IMAGE_EXTS_GLOB}")
+                               .first
+      self.logo_sound_path = Pathname.pwd
+                                     .join("resources")
+                                     .glob("*.#{AUDIO_EXTS_GLOB}")
+                                     .first
+      self.font_path = Pathname.pwd
+                               .join("resources")
+                               .glob("*.{#{FONT_EXTS_GLOB}}")
+                               .first
+    end
+
+    def cli
+      @cli ||= OptionParser.new do |parser|
+        parser.banner = "Exports an episode to a final video file.\n\n"
+
+        parser.on("-d", "--dir=DIR", "The episode directory") do |value|
+          self.episode_dir = Pathname.new(value).expand_path
+        end
+
+        parser.on("-o", "--[no-]overwrite", "Overwrite existing files") do |value|
+          self.overwrite = value
+          self.overwrite_voiceover = value
+          self.overwrite_vhs = value
+        end
+
+        parser.on("--[no-]overwrite-vhs", "Regenerate VHS") do |value|
+          self.overwrite_vhs = value
+        end
+
+        parser.on("--[no-]overwrite-voiceover", "Regenerate voiceover") do |value|
+          self.overwrite_voiceover = value
+        end
+
+        parser.on("--voiceover-output-format=FORMAT", "The voiceover output format") do |value|
+          self.voiceover_output_format = value
+        end
+
+        parser.on("--match=REGEX", "Only process segments matching REGEX") do |value|
+          self.match = Regexp.new(value)
+        end
+
+        parser.on("--intro-duration=DURATION", "The duration of the intro segment") do |value|
+          self.intro_duration = value.to_f
+        end
+
+        parser.on("--outro-duration=DURATION", "The duration of the outro segment") do |value|
+          self.outro_duration = value.to_f
+        end
+
+        parser.on("--crossfade-duration=DURATION", "The duration for segment's cross fade") do |value|
+          self.crossfade_duration = value.to_f
+        end
+
+        parser.on("--backtrack-path=PATH", "A dir or audio file that will be used as the backtrack") do |value|
+          self.backtrack_path = Pathname.new(value)
+        end
+
+        parser.on("--logo-path=PATH", "An image file that will be used as the logo on intro and outro segments") do |value|
+          self.logo_path = Pathname.new(value)
+        end
+
+        parser.on("--logo-sound-path=PATH", "The sound that will be used when showing the logo on the outro segment") do |value|
+          self.logo_sound_path = Pathname.new(value)
+        end
+      end
+    end
+
+    def run
+      cli.parse!
+      validate!
+
+      self.output_dir ||= Pathname.pwd.join("output/#{episode_dir.basename}")
+      self.logs_dir ||= output_dir.join("logs")
+    end
+
+    def validate!
+      unless episode_dir
+        puts "ERROR: --dir=DIR is required"
+        exit 1
+      end
+
+      unless episode_dir.directory?
+        puts "ERROR: #{episode_dir.to_s.inspect} is not a directory"
+        exit 1
+      end
+    end
+  end
+
+  class NewEpisode
+    attr_reader :title, :root_dir
+
+    def initialize(root_dir:)
+      @root_dir = root_dir
+      @title = ""
+    end
+
+    def cli
+      @cli ||= OptionParser.new do |parser|
+        parser.banner = "Creates a new episode directory.\n\n"
+
+        parser.on("-t", "--title=TITLE", "The episode title") do |value|
+          @title = value.strip
+        end
+      end
+    end
+
+    def run
+      cli.parse!
+      validate!
+      create_templates
+      self
+    end
+
+    def validate!
+      if title == ""
+        puts "ERROR: --title=TITLE is required"
+        exit 1
+      end
+    end
+
+    def create_templates
+      suffix = title.downcase.strip.gsub(/[^a-z0-9\-\s]/, "").gsub(/\s+/, "-")
+      dirname = [prefix, suffix].join("-")
+      episode_dir = root_dir.join("episodes/#{dirname}")
+      FileUtils.mkdir_p(episode_dir)
+      FileUtils.mkdir_p(episode_dir.join("scripts"))
+      FileUtils.mkdir_p(episode_dir.join("content"))
+      FileUtils.mkdir_p(episode_dir.join("resources"))
+
+      File.open(episode_dir.join("resources/config.tape"), "w") do
+        _1 << <<~TAPE
+          # The local configuration is a great place to specify
+          # required commands that must exist in the $PATH
+          Require ll
+          Require bat
+          Require slides
+        TAPE
+      end
+
+      File.open(episode_dir.join("title.txt"), "w") { _1 << title }
+      File.open(episode_dir.join("setup.sh"), "w") { _1 << "# Your setup here" }
+      File.open(episode_dir.join("scripts/001.txt"), "w") do
+        _1 << "This episode is going to be so amazing!\n"
+      end
+
+      global_config_path = relative_to(
+        Pathname.pwd.join("resources/config.tape"),
+        base: Pathname.pwd
+      )
+
+      local_config_path = relative_to(
+        episode_dir.join("resources/config.tape"),
+        base: Pathname.pwd
+      )
+
+      File.open(episode_dir.join("content/001.tape"), "w") do
+        _1 << <<~TAPE
+          Source "#{global_config_path.to_s}"
+          Source "#{local_config_path.to_s}"
+
+          Type "echo 'What an amazing episode!'"
+          Enter
+          Sleep 2s
+        TAPE
+      end
+    end
+
+    def prefix
+      number = root_dir
+        .glob("episodes/*")
+        .select(&:directory?)
+        .map { _1.basename.to_i }
+        .max
+      "#{number + 1}".rjust(3, "0")
+    end
+  end
+end
+
+def duration(path)
+  `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 #{path}`.strip.to_f
+end
+
+def relative_to(path, base:)
+  Pathname.new(path).expand_path.relative_path_from(base.expand_path)
+end
+
+class Episode
+  attr_reader :root_dir,
+              :resources_dir,
+              :options
+
+  def initialize(root_dir:, resources_dir:, options:)
+    @root_dir = root_dir
+    @resources_dir = resources_dir
+    @options = options
+  end
+
+  def segment_extractor(path)
+    path.basename(".*").to_s[/^(\d+).*/, 1]
+  end
+
+  def segments
+    @segments ||=
+      root_dir
+        .glob("content/*.{tape,jpg,png,mp4,mov}")
+        .uniq { segment_extractor(_1) }
+        .sort_by { segment_extractor(_1) }
+        .map { Segment.new(content_path: _1, episode: self) }
+  end
+
+  def execute(*args, log:, message: nil)
+    log_path = options.logs_dir.join("#{Time.now.to_i}-#{log}.txt")
+    args = args.flatten.compact.map(&:to_s)
+
+    File.open(log_path, "w") do |io|
+      io << "$ "
+      io << args.map { Shellwords.escape(_1) }.join(" ")
+      io << "\n\n"
+    end
+
+    File.open(log_path, "a") do |io|
+      started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      system(*args, out: io, err: io)
+      success = $?.exitstatus.zero?
+      ended_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      elapsed = ended_at - started_at
+      status = success ? "OK".green : "FAIL".red
+      message = "#{message}... #{status} #{"#{elapsed.round(2)}s".yellow}\n" if message
+
+      puts message if message
+      $stdout.flush
+
+      unless success
+        print "ERROR: Command failed. See ".red
+        print log_path.to_s.blue
+        print " for details.\n".red
+        exit 1
+      end
+    end
+  end
+
+  def outro_path
+    options.output_dir.join("other/outro.mp4")
+  end
+
+  def intro_path
+    options.output_dir.join("other/intro.mp4")
+  end
+
+  def generate_intro
+    execute "ffmpeg",
+            "-loop", "1",
+            "-i", options.logo_path,
+            "-filter_complex", "[0:v]scale=200:-1,format=rgba[img];[img]pad=1920:1080:110:200:black@0.0[padded];[padded]drawtext=text='#{title}':fontfile='#{options.font_path}':fontsize=144:fontcolor=white:x=100:y=300[imgtext];[imgtext]fade=t=out:st=4.5:d=0.5,setpts=PTS-STARTPTS[fade];anullsrc,atrim=end=5.5,apad,aresample=async=1[a]",
+            "-map", "[fade]",
+            "-map", "[a]",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuvj420p",
+            "-c:a", "aac",
+            "-ac", "1",
+            "-t", "#{options.intro_duration}",
+            "-y",
+            intro_path,
+            log: :intro,
+            message: log_message("Generating intro")
+  end
+
+  def generate_outro
+    execute "ffmpeg",
+            "-loop", "1",
+            "-i", options.logo_path,
+            "-i", options.logo_sound_path,
+            "-filter_complex", "[0:v]scale=350:-1,format=rgba[img];[img]pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black@0.0[padded];[padded]fade=t=in:st=0:d=0.5,fade=t=out:st=2.5:d=0.5,setpts=PTS-STARTPTS[fade];[1:a]apad,atrim=end=#{options.outro_duration},aresample=async=1,volume=1.0[a]",
+            "-map", "[fade]",
+            "-map", "[a]",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuvj420p",
+            "-c:a", "aac",
+            "-ac", "1",
+            "-shortest",
+            "-t", "#{options.outro_duration}",
+            "-y",
+            outro_path,
+            log: :outro,
+            message: log_message("Generating outro")
+  end
+
+  def title
+    @title ||= begin
+      lines = root_dir.join("title.txt").read.chomp.upcase.lines
+
+      if lines.size > 1
+        lines.join
+      else
+        words = lines.first.strip.split(/\s+/)
+        word_len = 15
+        breaks = []
+        current_line = []
+
+        words.each do |word|
+          if current_line.join(" ").length + word.length + 1 <= word_len
+            current_line << word
+          else
+            breaks << current_line.join(" ")
+            current_line = [word]
+          end
+        end
+
+        breaks << current_line.join(" ") unless current_line.empty?
+
+        breaks.join("\n")
+      end
+    end
+  end
+
+  def backtrack_path
+    options.output_dir.join("other/backtrack.mp3")
+  end
+
+  def input_backtrack_path
+    @input_backtrack_path ||= if options.backtrack_path.directory?
+                                options.backtrack_path
+                                       .glob("*.{#{AUDIO_EXTS_GLOB}}")
+                                       .sample
+                              else
+                                options.backtrack_path
+                              end
+  end
+
+  def final_path
+    options.output_dir.join("#{root_dir.basename}.mp4")
+  end
+
+  def audio_path
+    options.output_dir.join("#{root_dir.basename}.mp3")
+  end
+
+  def generate_backtrack
+    segments_duration = segments.sum do |segment|
+      meta = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 #{segment.video_path}`
+      meta.strip.to_f
+    end
+
+    # Account for crossfade transitions
+    # intro->seg1, seg1->seg2, ..., segN->outro
+    transition_count = segments.size + 1
+
+    # Outro starts at:
+    # intro + all segments - time saved by overlapping crossfades
+    outro_start = options.intro_duration + segments_duration -
+                  (transition_count * options.crossfade_duration)
+
+    # Backtrack processing: 100% volume -> fade to 10% at intro-1s -> 10% during segments -> fade out 2s before outro
+    fade_to_quiet_start = options.intro_duration - 1.0  # Start fading at 4.5s
+    fade_to_quiet_duration = 1.0  # Fade over 1 second
+    quiet_start = options.intro_duration  # 10% volume starts at 5.5s
+    final_fade_duration = 2.0  # Fade out over 2 seconds
+    final_fade_start = outro_start - final_fade_duration  # Start fading before outro
+    backtrack_end = outro_start  # End backtrack when outro begins
+
+    execute "ffmpeg",
+            "-stream_loop", "-1",
+            "-i", input_backtrack_path,
+            "-t", backtrack_end,
+            "-filter_complex",
+            "asplit=4[a1][a2][a3][a4];"\
+            "[a1]volume=1.0,atrim=end=#{fade_to_quiet_start},asetpts=PTS-STARTPTS[full];"\
+            "[a2]atrim=start=#{fade_to_quiet_start}:end=#{quiet_start},asetpts=PTS-STARTPTS,volume='1.0-0.9*t/#{fade_to_quiet_duration}':eval=frame[fade_to_quiet];"\
+            "[a3]volume=0.1,atrim=start=#{quiet_start}:end=#{final_fade_start},asetpts=PTS-STARTPTS[quiet];"\
+            "[a4]volume=0.1,atrim=start=#{final_fade_start}:end=#{backtrack_end},asetpts=PTS-STARTPTS,afade=t=out:st=0:d=#{final_fade_duration}[fade_out];"\
+            "[full][fade_to_quiet][quiet][fade_out]concat=n=4:v=0:a=1",
+            "-y",
+            backtrack_path,
+            log: :backtrack,
+            message: log_message("Generating backtrack music with #{relative_to(input_backtrack_path, base: Pathname.pwd).to_s.blue}")
+  end
+
+  def generate_final_file
+    # Build input files list: intro, segments, outro
+    all_videos = [intro_path] + segments.map(&:video_path) + [outro_path]
+
+    # Build ffmpeg inputs
+    inputs = all_videos.flat_map { |path| ["-i", path] }
+    inputs += ["-i", backtrack_path]
+
+    # Build xfade filter chain for video with crossfades
+    video_filters = []
+    audio_filters = []
+    offset = 0
+
+    all_videos.each_with_index do |video_path, index|
+      video_duration = duration(video_path)
+
+      if index == 0
+        # First video (intro)
+        video_filters << "[#{index}:v]setpts=PTS-STARTPTS[v#{index}]"
+        audio_filters << "[#{index}:a]asetpts=PTS-STARTPTS[a#{index}]"
+        offset = video_duration - options.crossfade_duration
+      elsif index == all_videos.size - 1
+        # Last video (outro) - xfade from previous
+        prev_label = index == 1 ? "v0" : "vx#{index-2}"
+        video_filters << "[#{index}:v]setpts=PTS-STARTPTS[v#{index}]"
+        video_filters << "[#{prev_label}][v#{index}]xfade=transition=fade:duration=#{options.crossfade_duration}:offset=#{offset}[vfinal]"
+        audio_filters << "[#{index}:a]adelay=#{(offset * 1000).to_i}|#{(offset * 1000).to_i}[a#{index}]"
+      else
+        # Middle videos - xfade from previous
+        prev_label = index == 1 ? "v0" : "vx#{index-2}"
+        video_filters << "[#{index}:v]setpts=PTS-STARTPTS[v#{index}]"
+        video_filters << "[#{prev_label}][v#{index}]xfade=transition=fade:duration=#{options.crossfade_duration}:offset=#{offset}[vx#{index-1}]"
+        audio_filters << "[#{index}:a]adelay=#{(offset * 1000).to_i}|#{(offset * 1000).to_i}[a#{index}]"
+        offset += video_duration - options.crossfade_duration
+      end
+    end
+
+    # Concatenate all audio tracks
+    audio_inputs = all_videos.size.times.map { |i| "[a#{i}]" }.join
+    audio_filters << "#{audio_inputs}amix=inputs=#{all_videos.size}:duration=longest:normalize=0[mixed]"
+
+    # Mix with backtrack
+    audio_filters << "[mixed][#{all_videos.size}:a]amix=inputs=2:duration=first:normalize=0[afinal]"
+
+    filter_complex = (video_filters + audio_filters).join(";")
+
+    execute "ffmpeg",
+            *inputs,
+            "-filter_complex",
+            filter_complex,
+            "-map", "[vfinal]",
+            "-map", "[afinal]",
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-y",
+            final_path,
+            log: :final_export,
+            message: log_message("Generating final video file")
+
+    puts log_message(
+      "Final file has been exported to %{path}",
+      path: relative_to(final_path, base: Pathname.pwd).to_s.blue
+    )
+  end
+
+  def run_prepare
+    prepare_script_path = Pathname.pwd.join("stitch_prepare.sh")
+
+    unless prepare_script_path.file?
+      puts log_message(
+        "No prepare script found... %{found} %{skip}",
+        found: "OK".green,
+        skip: "0s".yellow
+      )
+      return
+    end
+
+    execute "bash",
+            prepare_script_path,
+            log: :prepare,
+            message: log_message("Running prepare script")
+  end
+
+  def run_setup
+    execute "bash",
+            root_dir.join("setup.sh"),
+            log: :setup,
+            message: log_message("Running setup script")
+  end
+
+  def last_segment?(segment)
+    segments.last == segment
+  end
+
+  def log_prefix
+    @log_prefix ||= "[episode:#{root_dir.basename.to_s[/^(\d+)/, 1]}]".magenta
+  end
+
+  def log_message(message, **kwargs)
+    format("#{log_prefix} #{message}", **kwargs)
+  end
+
+  def generate
+    FileUtils.rm_rf(options.logs_dir)
+
+    %w[tapes raw segments other voiceover logs].each do |dir|
+      FileUtils.mkdir_p(options.output_dir.join(dir))
+    end
+
+    base = Pathname.pwd
+
+    options.instance_variables.sort.each do |ivar|
+      next if ivar == :@cli
+      name = ivar.to_s[1..-1].tr("_", " ").capitalize
+      value = options.instance_variable_get(ivar)
+      value = if value.is_a?(Pathname)
+                relative_to(value, base: base)
+              else
+                value
+              end
+      puts log_message("#{name}: %{value}", value: value.to_s.blue)
+    end
+
+    if segments.empty?
+      puts "ERROR: No segments found in episode"
+      exit 1
+    end
+
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    run_prepare
+    run_setup
+    generate_intro
+    generate_outro
+
+    segments.each_slice(Etc.nprocessors) do |slice|
+      slice.filter_map do |segment|
+        Thread.new { segment.generate }
+              .tap { _1.abort_on_exception = true }
+      end.each(&:join)
+    end
+
+    # segments.each(&:generate)
+    generate_backtrack
+    generate_final_file
+    ended_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    puts log_message(
+      "Episode generated in %{duration}",
+      duration: "#{(ended_at - started_at).round(2)}s".green
+    )
+  end
+end
+
+class Segment
+  attr_reader :content_path, :episode
+
+  ContentType = Struct.new(:type) do
+    def tape? = type == :tape
+    def video? = type == :video
+    def image? = type == :image
+  end
+
+  def initialize(content_path:, episode:)
+    @episode = episode
+    @content_path = content_path
+  end
+
+  def execute(*, **)
+    episode.execute(*, **)
+  end
+
+  def content_type
+    @content_type ||= case content_path.extname
+                      when /\.tape/
+                        ContentType.new(:tape)
+                      when /\.jpg$/, /\.png$/
+                        ContentType.new(:image)
+                      when /\.mp4$/, /\.mov$/
+                        ContentType.new(:video)
+                      else
+                        puts "ERROR: Unknown content type for #{content_path.to_s.inspect}".red
+                        exit 1
+                      end
+  end
+
+  def basename
+    @basename ||= content_path.basename(".*").to_s
+  end
+
+  def audio_path
+    episode.root_dir.join("audio/#{basename}.mp3")
+  end
+
+  def tmp_tape_path
+    output_dir.join("tapes/#{basename}.tape")
+  end
+
+  def raw_video_path
+    output_dir.join("raw/#{basename}.mp4")
+  end
+
+  def video_path
+    output_dir.join("segments/#{basename}.mp4")
+  end
+
+  def tape
+    tape = []
+    tape << "Set Width 1920"
+    tape << "Set Height 1080"
+    tape << %[Output "#{raw_video_path}"]
+    tape << content_path.read
+    tape.join("\n")
+  end
+
+  def merge_audio_with_video
+    # Get video duration
+    video_duration = duration(raw_video_path)
+
+    # Get audio duration
+    audio_duration = duration(voiceover_path)
+
+    # Calculate the content duration and extend by crossfade duration
+    content_duration = [video_duration, audio_duration].max
+    final_duration = content_duration + episode.options.crossfade_duration
+
+    # Calculate padding needed for audio (content + silence for crossfade)
+    audio_pad_samples = ((final_duration - audio_duration) * 44100).to_i
+
+    # Calculate padding needed for video (content + cloned frame for crossfade)
+    video_pad_duration = final_duration - video_duration
+
+    # Build filter - extend both video and audio to accommodate crossfade
+    filter_complex = "[0:v]tpad=stop_mode=clone:stop_duration=#{video_pad_duration}[v];" \
+                     "[1:a]aresample=async=1,apad=pad_len=#{audio_pad_samples}[a]"
+
+    execute "ffmpeg",
+            "-i", raw_video_path,
+            "-i", voiceover_path,
+            "-filter_complex",
+            filter_complex,
+            "-map", "[v]",
+            "-map", "[a]",
+            "-y",
+            video_path,
+            log: "#{basename}-merge-video-and-audio",
+            message: log_message("Merging audio with video")
+  end
+
+  def voiceover_path
+    output_dir.join("voiceover/#{basename}.mp3")
+  end
+
+  def script_path
+    episode.root_dir.join("scripts/#{basename}.txt")
+  end
+
+  def generate_voiceover
+    unless basename.match?(episode.options.match)
+      puts log_message("Skipping voiceover... %{text}", text: "no match".yellow)
+      return
+    end
+
+    if audio_path.file? && !episode.options.overwrite_voiceover?
+      puts log_message(
+        "Generating voiceover... %{found} %{skip}",
+        found: "OK".green,
+        skip: "0s".yellow
+      )
+      return
+    end
+
+    FileUtils.mkdir_p(audio_path.dirname)
+
+    execute "node",
+            File.join(__dir__, "stitch-voiceover"),
+            "--text-file", script_path,
+            "--output-file", audio_path,
+            "--output-format", episode.options.voiceover_output_format,
+            "--force",
+            log: "#{basename}-voiceover",
+            message: log_message("Generating voiceover")
+  end
+
+  def generate_image_content
+    duration = duration(audio_path)
+
+    execute "ffmpeg",
+            "-loop", "1",
+            "-i", content_path,
+            "-filter_complex", "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v]",
+            "-map", "[v]",
+            "-c:v", "libx264",
+            "-t", duration,
+            "-pix_fmt", "yuv420p",
+            "-y",
+            raw_video_path,
+            log: "#{basename}-image-to-video",
+            message: log_message("Generating video from image")
+  end
+
+  def generate_video_content
+    execute "ffmpeg",
+            "-i", content_path,
+            "-an",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-y",
+            raw_video_path,
+            log: "#{basename}-copy-video",
+            message: log_message("Copying video")
+  end
+
+  def generate_vhs_content
+    if raw_video_path.file? && !episode.options.overwrite_vhs?
+      puts log_message(
+        "Generating VHS video... %{found} %{skip}",
+        found: "OK".green,
+        skip: "0s".yellow,
+      )
+      return
+    end
+
+    execute "vhs",
+            tmp_tape_path,
+            log: "#{basename}-vhs",
+            message: log_message("Generating VHS video")
+  end
+
+  def normalize_voiceover
+    if voiceover_path.file? && !episode.options.overwrite_voiceover?
+      puts log_message(
+        "Normalizing voiceover... %{found} %{skip}",
+        found: "OK".green,
+        skip: "0s".yellow
+      )
+      return
+    end
+
+    execute "ffmpeg-normalize",
+            audio_path,
+            "-f",
+            "-o", voiceover_path,
+            "-nt", "ebu",
+            "-t", "-18",
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            "-ar", "44100",
+            log: "#{basename}-normalize-voiceover",
+            message: log_message("Normalizing voiceover")
+  end
+
+  def log_prefix
+    "[segment:#{basename}]".cyan
+  end
+
+  def log_message(message, **kwargs)
+    format("#{log_prefix} #{message}", **kwargs)
+  end
+
+  def output_dir
+    episode.options.output_dir
+  end
+
+  def generate
+    generate_voiceover
+
+    File.open(tmp_tape_path, "w") {|io| io << tape }
+
+    if basename.match?(episode.options.match)
+      case content_type.type
+      when :tape
+        generate_vhs_content
+      when :image
+        generate_image_content
+      when :video
+        generate_video_content
+      end
+    else
+      puts log_message("Skipping content... %{text}", text: "no match".yellow)
+      return
+    end
+
+    normalize_voiceover
+    merge_audio_with_video
+  end
+end
+
+root_dir = Pathname.pwd
+
+case ARGV.first
+when "export"
+  cli = CLI::Export.new
+  cli.run
+
+  Episode.new(
+    root_dir: cli.episode_dir,
+    resources_dir: root_dir.join("resources"),
+    options: cli
+  ).generate
+when "new"
+  cli = CLI::NewEpisode.new(root_dir:)
+  cli.run
+else
+  puts "Usage: bin/stitch [export|new]"
+
+  exit 1
+end
