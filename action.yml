@@ -41,7 +41,7 @@ runs:
 
         echo "VOICE_CACHE_KEY=episode-voiceover-${{ inputs.episode }}-${VOICE_HASH}" >> $GITHUB_ENV
         echo "VOICE_RESTORE_KEYS=episode-voiceover-${{ inputs.episode }}-" >> $GITHUB_ENV
-        echo "RAW_CACHE_KEY=episode-vhs-${{ inputs.episode }}-${CONTENT_HASH}" >> $GITHUB_ENV
+        echo "RAW_CACHE_KEY=episode-raw-${{ inputs.episode }}-${CONTENT_HASH}" >> $GITHUB_ENV
         echo "RAW_RESTORE_KEYS=episode-raw-${{ inputs.episode }}-" >> $GITHUB_ENV
 
     - name: Find episode dir
