@@ -846,7 +846,6 @@ class Segment
       end
     else
       puts log_message("Skipping content... %{text}", text: "no match".yellow)
-      return
     end
 
     normalize_voiceover
